@@ -53,12 +53,22 @@
 ### paged attention
 
 > 原因：不清楚最后句子长度，原本直接分配2024浪费空间。减少llm中间产生的连续结果的浪费
-> 
 
-* 分块存储
+
+* 分块存储 kv Block
+> 利用率从20%-40%提升到96%
 ![alt text](img/llm/image.png)
+![Alt text](img/llm/image-10.png)
+
+* KV Block共享：大模型同一个Prompt，生成多个Output
+![Alt text](img/llm/image-11.png)
+生成第一个 Color，引用为2，执行copy on write
+![Alt text](img/llm/image-12.png)
+第二个序列生成Matter，引用为1，则直接加入
+![Alt text](img/llm/image-13.png)
 
 
+> vllm - cuda
 
 ## tiktoken 离线
 
