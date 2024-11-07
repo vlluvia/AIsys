@@ -59,6 +59,57 @@ Big bird: Transformers for longer sequences.
 
 上述倾向减少时间，忽略IO
 
+## Softmax的动态更新
+
+### 常规Softmax
+![Alt text](img/attention/flash-attention/pic-10.png)
+
+
+### Stable softmax
+
+* EXP求和项
+
+![Alt text](img/attention/flash-attention/pic-11.png)
+
+
+### softmax 分块
+
+* x = [x1, x2]
+![Alt text](img/attention/flash-attention/pic-12.png)
+
+* 处理完x(1)保存
+m_max = m(x^(x1))
+l_all = l(x^(x1))
+
+* 用和x(1)相同的方法处理x(2)
+![Alt text](img/attention/flash-attention/pic-13.png)
+
+
+* 开始合并x(1) 和 x(2)
+![Alt text](img/attention/flash-attention/pic-14.png)
+![Alt text](img/attention/flash-attention/pic-15.png)
+
+* 解析
+![Alt text](img/attention/flash-attention/pic-16.png)
+
+* 基于上述步骤，直接推导 softmax，更新全局
+更新分子
+![Alt text](img/attention/flash-attention/pic-17.png)
+根据上述公式，带入公式16
+![Alt text](img/attention/flash-attention/pic-18.png)
+
+更新分母
+![Alt text](img/attention/flash-attention/pic-19.png)
+
+合并分子和分母
+![Alt text](img/attention/flash-attention/pic-20.png)
+
+
+* 我们在更新x(2)的softmax值时，额外保存的几个量
+![Alt text](img/attention/flash-attention/pic-21.png)
+
+
+
 ## 方法
 
 *   问题
@@ -71,6 +122,8 @@ Big bird: Transformers for longer sequences.
 1.  tiling：切割输入矩阵
 2.  存储前向传播时softmax归一化因子
 
+![Alt text](img/attention/flash-attention/pic-25.png)
+
 ### 减少HBM的访问量
 
 Q\K\V 分块，从HBM加载到SRAM，计算这些块的注意力输出
@@ -79,8 +132,12 @@ Q\K\V 分块，从HBM加载到SRAM，计算这些块的注意力输出
 
 *   Tiling
 ![Alt text](img/attention/flash-attention/pic-1.png)
-
 ![Alt text](img/attention/flash-attention/pic-2.png)
+
+
+![Alt text](img/attention/flash-attention/pic-22.png)
+![Alt text](img/attention/flash-attention/pic-23.png)
+![Alt text](img/attention/flash-attention/pic-24.png)
 
 *   Recomputation
 
@@ -90,6 +147,8 @@ Q\K\V 分块，从HBM加载到SRAM，计算这些块的注意力输出
 
 *   Implementation details: Kernel fusion
 ![Alt text](img/attention/flash-attention/pic-3.png)
+
+
 
 
 ### block-sparse FlashAttention
