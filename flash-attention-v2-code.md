@@ -308,5 +308,66 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params)
 
 
 
+#### compute_attn - compute_attn_1rowblock
+
+* 基本参数
+1. shared memory
+2. tid, kBlockM, kBlockN, kHeadDim,KNWarps
+3. seed, offset, dropout
+4. 0块线程，保存 RNG 状态（seed，offset），用于反向传播
+5. m_block * kBlockM >= binfo.actual_seqlen_q ，满足条件提前退出当前线程块的执行（确定m block 执行的范围）
+6. 确定n block执行的范围
+7. 在键序列长度为零或处理范围无效时，以避免访问越界元素
+提前退出并写入零到全局内存中的输出（gO）和局部缩放指数（gLSE）
+(Is_causal || Is_local || !Is_even_MN) && n_block_max <= n_block_min
+8. 反向迭代块（提前知道最后一个块需要掩码处理，从而在读取全局内存时直接应用掩码，并且可能减少寄存器的使用。）【重点】
+为了在从全局内存读取K和V时，最后一个块需要进行掩码处理。此外，反向迭代可能节省一个寄存器（只需要n_block而不是n_block和n_block_max）
+
+row_offset_p，mQ，gQ，mK，gK，mV，gV，gP
+sQ, sK, SV, sVt, sVtNoSwizzle
+gP 是一个张量，用于存储注意力分数矩阵（Attention Scores Matrix）。在自注意力机制中，注意力分数矩阵是通过查询（Q）和键（K）的点积计算得到的。gP 的作用是将这些注意力分数矩阵分块加载到共享内存中，以便在GPU上进行高效的计算
+
+9. 创建张量，将全局内存中的查询（Q）、键（K）和值（V）张量分块加载到共享内存中
+10. 创建张量，将共享内存中的查询（Q）、键（K）和值（V）张量重新分块（retiling）
+11. 设置谓词
+12. 实际将（QK）数据从全局内存（gmem）拷贝到共享内存（smem），并在必要时进行同步操作
+flash::copy
+13. 将两种不同的迭代分开处理：
+(1) 需要对S进行掩码处理的迭代部分
+(a) 当K和V的长度不是kBlockN的整数倍时，最后一个块需要进行掩码处理。
+(b) 如果S是因果的（causal），则对于最后ceil_div(kBlockM, kBlockN)个块，也需要进行掩码处理。
+如果even_N为假（即不是kBlockN的整数倍），那么seqlen_k可能会在一个块的中间结束。在这种情况下，我们需要对两个块进行掩码处理（例如，当kBlockM == kBlockN时），而不仅仅是一个块。
+\\
+计算出在不同情况下需要进行的掩码步骤的数量。关键在于是否是因果关系、是否是局部关系、以及块的大小关系（kBlockM 和 kBlockN）。
+(a) tiled_mma 分区为一个形状为 (MMA=4, MMA_M, MMA_N) 的张量 acc_s
+(b) 根据 masking_step 的值来处理 gV 的复制操作
+masking_step == 0, 清理最后一块block中共享存储的数据(/*Clear_OOB_MN=*/true)
+masking_step > 0, 进行数据的复制操作
+(c) 进行矩阵乘法(QK)操作，将结果存储在 acc_s 中
+```
+flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+    acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+    smem_thr_copy_Q, smem_thr_copy_K
+);
+```
+softcap 限制矩阵乘法结果的最大值，防止数值溢出或不稳定。
+
+(d) 应用掩码到矩阵乘法的结果 acc_s 上
+(e) 对不完整的块，能够正确地进行数据复制和同步，避免数据竞争和计算错误
+(f) acc_s从fp32转成fp16/bf16 存为 rp, 判断是否使用dropout
+(g) 根据硬件重塑rp
+在代码中，rP 的原始形状为 (MMA=4, MMA_M, MMA_N)。根据使用的矩阵乘法内核（如 m16n8k16 或 m16n8k8），rP 的形状可能会被重塑为 ((4, 2), MMA_M, MMA_N / 2) 或保持为 (4, MMA_M, MMA_N)。
+(h) rp (S) 和 V相乘
+
+
+\\
+(2) 不需要对S进行掩码处理的迭代部分
+
+类似（1）
+
+14. 后处理（epilogue）
+计算对数似然估计（LSE）softmax 
+将 lse 张量中的值写入到 gLSE 张量中
+保存output
 
 
