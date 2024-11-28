@@ -162,20 +162,20 @@ params.num_splits：表示将计算任务分成多少个部分（splits）。
 batch_size：表示批量大小。
 num_heads：表示多头注意力机制中的头数。
 max_seqlen_q：表示查询序列的最大长度。
-\\
+
 {2, 4, 8, 64}
 表示有 2 个 splits，每个 split 有 4 个批次，每个批次有 8 个头，每个头有 64 个查询序列长度。
-\\
+
 (2) out_accum = {params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}
 params.num_splits：表示将计算任务分成多少个部分（splits）。
 batch_size：表示批量大小。
 num_heads：表示多头注意力机制中的头数。
 max_seqlen_q：表示查询序列的最大长度。
 head_size_rounded：表示每个头的尺寸（可能进行了对齐处理）。
-\\
+
 {2, 4, 8, 64, 64}
 表示有 2 个 splits，每个 split 有 4 个批次，每个批次有 8 个头，每个头有 64 个查询序列长度，每个头的尺寸为 64。
-\\
+
 
 9. num_splits_heuristic
 通过启发式方法找到最佳的 num_splits，以最大化 GPU 的占用率（occupancy），同时避免过多的 HBM（High Bandwidth Memory）读写操作。
@@ -287,6 +287,11 @@ smem_size 是动态共享内存的大小。
 
 #### run_mha_fwd(run_mha_fwd_splitkv_dispatch)
 
+在之前的基础上对kv维度进行了进一步的拆分，分配到不同thread block中并行运行，然后再合并中间结果生成最终结果，适用于batch_size x seq_len x head_size 不够大等场景，以进一步增大并行度提高GPU利用率。
+
+*  Prologue
+旋转嵌入的内存块复制操作
+
 
 
 #### flash_fwd_kernel.h
@@ -296,12 +301,12 @@ csrc\flash_attn\src\flash_fwd_kernel.h
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn(const Params &params)
 
-\\
+
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn(const Params &params)
 
-\\
+
 
 template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K, typename Params>
 inline __device__ void combine_attn_seqk_parallel(const Params &params)
@@ -309,18 +314,58 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params)
 
 
 #### compute_attn - compute_attn_1rowblock
+![Alt text](./img/attention/flash-attention-v2/image-code-6.webp)
+
+* 输入参数
+1. Is_causal: 是否需要应用causal_mask, 与Is_local互斥，计算公式 i+k-q > 0 则为 1（掩码掉设置为0） 或者 保留
+其中 i 为 当前查询q的位置， k 为 查询 k 的位置
+if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+![Alt text](./img/attention/flash-attention-v2/image-code-3.png)
+![Alt text](./img/attention/flash-attention-v2/image-code-5.png)
+2. Is_local
+是否应用sliding_window_local_attention, =(params.window_size_left >= 0 || params.window_size_left >= 0) && !Is_causal
+
+query位置i对应的key计算范围 [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]]
+(window_size_left,window_size_left) 到本函数有四种取值：
+(-1, -1)：表示不应用滑动窗口局部注意力。
+(seq_len_k, >=0)：表示左侧窗口大小为键序列的长度，右侧窗口大小为非负数。
+(>=0, seq_len_k)：表示左侧窗口大小为非负数，右侧窗口大小为键序列的长度。
+(>=0, >=0)：表示左侧和右侧窗口大小均为非负数。
+
+3. Has_alibi
+是否加上alibi斜率偏置，=params.alibi_slopes_ptr != nullptr
+(-alibi_slope * |i + seqlen_k - seqlen_q - j|) is added to the attention score of query i and key j.
+4. Is_even_MN
+用kBlockM和kBlockN对seqlen_q和seqlen_k进行分块后是否能被整除，params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0
+5. Is_even_K
+headDim是否是32的倍数，模板对headDim进行了32,64,96,128,160,192,224,256的向上取整，=params.d == Kernel_traits::kHeadDim
 
 * 基本参数
+S=QK, P=softmax(S), O=PV
 1. shared memory
 2. tid, kBlockM, kBlockN, kHeadDim,KNWarps
-3. seed, offset, dropout
-4. 0块线程，保存 RNG 状态（seed，offset），用于反向传播
-5. m_block * kBlockM >= binfo.actual_seqlen_q ，满足条件提前退出当前线程块的执行（确定m block 执行的范围）
-6. 确定n block执行的范围
-7. 在键序列长度为零或处理范围无效时，以避免访问越界元素
+ // eg. Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>
+seqlen_q 维度按kBlockM进行划分，每个threadblock处理kBlockM大小的q，eg. 128
+seqlen_k 维度按kBlockN进行划分，每个threadblock处理完整的seqlen_k，按kBlockN大小切分后迭代计算，eg.32
+每个head处理的维度，eg. 32,64,96,128,160,192,224,256
+一个threadblock中的设置的warps数量，eg.4
+
+1. seed, offset, dropout
+2. 0块线程，保存 RNG 状态（seed，offset），用于反向传播
+3. m_block * kBlockM >= binfo.actual_seqlen_q ，满足条件提前退出当前线程块的执行（确定m block 执行的范围）
+4. 确定n block执行的范围
+5. 在键序列长度为零或处理范围无效时，以避免访问越界元素
 提前退出并写入零到全局内存中的输出（gO）和局部缩放指数（gLSE）
 (Is_causal || Is_local || !Is_even_MN) && n_block_max <= n_block_min
-8. 反向迭代块（提前知道最后一个块需要掩码处理，从而在读取全局内存时直接应用掩码，并且可能减少寄存器的使用。）【重点】
+1. 反向迭代块（提前知道最后一个块需要掩码处理，从而在读取全局内存时直接应用掩码，并且可能减少寄存器的使用。）【重点】
 为了在从全局内存读取K和V时，最后一个块需要进行掩码处理。此外，反向迭代可能节省一个寄存器（只需要n_block而不是n_block和n_block_max）
 
 row_offset_p，mQ，gQ，mK，gK，mV，gV，gP
@@ -333,11 +378,13 @@ gP 是一个张量，用于存储注意力分数矩阵（Attention Scores Matrix
 12. 实际将（QK）数据从全局内存（gmem）拷贝到共享内存（smem），并在必要时进行同步操作
 flash::copy
 13. 将两种不同的迭代分开处理：
-(1) 需要对S进行掩码处理的迭代部分
+![Alt text](./img/attention/flash-attention-v2/image-code-4.png)
+(1) 需要对S进行掩码处理的迭代部分，（带mask的主体计算）
 (a) 当K和V的长度不是kBlockN的整数倍时，最后一个块需要进行掩码处理。
 (b) 如果S是因果的（causal），则对于最后ceil_div(kBlockM, kBlockN)个块，也需要进行掩码处理。
 如果even_N为假（即不是kBlockN的整数倍），那么seqlen_k可能会在一个块的中间结束。在这种情况下，我们需要对两个块进行掩码处理（例如，当kBlockM == kBlockN时），而不仅仅是一个块。
-\\
+
+
 计算出在不同情况下需要进行的掩码步骤的数量。关键在于是否是因果关系、是否是局部关系、以及块的大小关系（kBlockM 和 kBlockN）。
 (a) tiled_mma 分区为一个形状为 (MMA=4, MMA_M, MMA_N) 的张量 acc_s
 (b) 根据 masking_step 的值来处理 gV 的复制操作
@@ -360,14 +407,60 @@ softcap 限制矩阵乘法结果的最大值，防止数值溢出或不稳定。
 (h) rp (S) 和 V相乘
 
 
-\\
+
 (2) 不需要对S进行掩码处理的迭代部分
 
 类似（1）
 
-14. 后处理（epilogue）
+1.  后处理（epilogue）
 计算对数似然估计（LSE）softmax 
 将 lse 张量中的值写入到 gLSE 张量中
 最终将处理后的输出数据存储到全局内存中。
+寄存器->共享内存 -> 寄存器 -> 全局内存，这样做的目的是对数据重新排列后最大化寄存器输出到全局内存的写入带宽
 
 
+#### compute_attn - compute_attn_1rowblock_splitkv
+
+![Alt text](./img/attention/flash-attention-v2/image-code-7.gif)
+
+首先介绍下拆分成多少个split的代码逻辑，主要目标是最大化SM利用率，根据batch x num_heads x q_len乘积结果、当前GPU的硬件特性(SM个数)和拆分前kv组数来计算最终拆分的组数，尽量让SM利用率保持在85%以上，代码如下所示。
+1. 计算得到kv上的切分数，从而最大化SM利用率
+2. batch_nheads_mblocks是batch, heads, q_len维度上的分组数，作为最终block数的一项乘法因子
+3. num_n_blocks是拆分前kv组数
+4. 计算拆分后的平均efficiency
+5. 选择满足85%利用率最小的拆分
+
+* 对block table类型的kvcache使用
+首先介绍block table类型的kvcache的使用，kvcache就不多介绍已经成为事实标准了，这里的block table主要是引用了pagedAttention的分页思想，优化 kvcache 内存管理，增大吞吐量。
+
+kvcahce的shape不再按照逻辑上的(batch_size_cache, seqlen_cache, nheads_k, headdim)进行存储，而是变成(num_blocks, page_block_size, nheads_k, headdim)，即按page_block_size进行了划分
+
+
+![Alt text](./img/attention/flash-attention-v2/image-code-8.png)
+
+由于page_block_size足够大且是256倍数，所以一次(kBlockM,kHeadDim)x(kHeadDim,kBlockN)的运算读取的内容发生在单块内，不存在跨block的可能性
+
+kvcache的组织shape是(num_blocks, page_block_size, nheads_k, headdim)，而运算是(kBlockM,headdim)，如何跨越nheads维度进行计算呢？代码里使用到了cute::Tensor定义中的stride进行跨nhead抽取，从而方便进行head并行运算。
+```
+Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.k_ptr) + row_offset_k),
+                        Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                        make_stride(params.k_row_stride, _1{})); // 使用k_row_stride进行tensor组织
+Tensor gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.v_ptr) + row_offset_v),
+                        Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                        make_stride(params.v_row_stride, _1{})); // 使用v_row_stride进行tensor组织
+```
+
+
+#### flash_fwd_splitkv_combine_kernel
+
+调用链：flash_fwd_splitkv_combine_kernel -> combine_attn_seqk_parallel
+
+每个split block在完成attention计算后都生成了(kBlckM, kHeadDim)的中间结果，combine_attn_seqk_parallel 这个函数的作用就是将split_num个(kBlckM, kHeadDim)中间结果校正归约成最终正确的结果，整体流程如下图所示，总共有5个小步骤。
+
+1. 将lse_accum从全局内存拷贝到共享内存。
+2. 对lse_accum进行归约，求得最终真实的lse_logsum。
+3. 利用lse_logsum和lse_accum生成校正的lse_scale。
+4. 利用lse_scale对每个(kBlckM, kHeadDim)中间结果进行校准后归约求和。
+5. 将结果写回全局内存中。
+
+![Alt text](./img/attention/flash-attention-v2/image-code-9.png)
