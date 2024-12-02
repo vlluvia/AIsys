@@ -58,3 +58,89 @@ cute（cutlass）中还有另一种swizzle，为thread block swizzle。在以C�
 
 ![Alt text](../../img/cutlass-cute-nccl-cuda/cute/image-swizzle-10.png)
 
+
+
+---
+
+## 
+
+一个warp(32个线程)的访存尽量要避免访问同一个bank中的数据，否则就要串行分多次来进行访问
+![Alt text](../../img/cutlass-cute-nccl-cuda/cute/image-swizzle-11.png)
+经常使用的GEMM操作在逻辑上是通过二维矩阵表示的
+![Alt text](../../img/cutlass-cute-nccl-cuda/cute/image-swizzle-12.png)
+
+如果逻辑layout直接存储映射到物理结构上，访问一个子矩阵就会出现大量的bank conflict，导致性能急剧下降。比如图中矩阵，warp内所有线程对红线上元素的访问都会产生bank conflict。
+
+cute Swizzle登场了，它就是为了解决逻辑结构上的需要和物理存储结构设计不一致的问题，有了它就不需要去关心物理结构设计了，只需要关注在逻辑上的矩阵layout，Swizzle会帮你去尽量解决底层bank conflict的问题。
+
+## cute Swizzle本质
+cute Swizzle本质就是一种映射，将二维逻辑结构映射到二维物理结构上，屏蔽掉底层结构的物理特性。
+
+## cute Swizzle抽象
+![Alt text](../../img/cutlass-cute-nccl-cuda/cute/image-swizzle-13.png)
+得到上图结果后还需要对每个单元进行异或重排操作，目的是为了把数据打散到不同bank中
+![Alt text](../../img/cutlass-cute-nccl-cuda/cute/image-swizzle-14.png)
+
+![Alt text](../../img/cutlass-cute-nccl-cuda/cute/image-swizzle-15.png)
+
+图中演示了矩阵A的第一个分块子矩阵(深色部分)逐步映射到共享内存的流程。
+1. 首先将矩阵A进行一维向量化，就是拍平，得到每个元素对应的线性offset，其实就是cute layout的作用。
+2. 定义Swizzle为Swizzle<3, 3, 3>作用到该线性空间上，即把这个向量按顺序依次平铺到Swizzle空间上。Swizzle<3, 3, 3>其实是一个8x8x8的表示（8个元素为一组基本单位，有8行8列）。
+3. 进行行号和列号的异或运算得到新的列号再移动过去，得到最终的物理层表示。
+
+
+---
+# cutlass swizzle机制解析（一）
+
+* swizzle机制主要起到两种作用：
+  * Thread Block Swizzle：利用局部性原理，重映射block id改变其发射顺序，提高L2 cache命中率；
+  * 保证GEMM pipeline在进行warp tile计算的时候，读写共享内存是无bank冲突的。这也是本文要讨论的主题。
+
+shared memory是可编程的L1 memory，为了读写效率被组织成32路bank，每路（4字节，32bit），当一个warp中的不同线程访问同一个bank时，该访问过程将会被串行化，这将极大影响效率（有一种例外情况——广播）
+
+swizzle机制主要通过物理layout到逻辑layout的重映射。
+
+为了用一个warp完成这个过程，这里需要分成4个phase，其中T0-7为phase 0、T8-15为phase 1、T16-23为phase 2、T24-31为phase 4，每个phase读取一个8x8xfp16矩阵，每个phase（8个线程）中的每个线程负责读取一行的8xfp16=16bytes=128bit（vector）=4bank数据。注意，这一行的4bank数据必须连续，每个线程之间的4bank数据则不要求连续，满足对齐要求即可。因此，这里对bank冲突的讨论将从一个warp变成一个phase（8个线程），只需要保证这8个线程读取的时候不会发生bank冲突即可。
+![Alt text](../../img/cutlass-cute-nccl-cuda/cute/image-swizzle-16.png)
+
+* 对于矩阵A，ISA中每个线程实际寄存器得到的数据如图所示：
+
+![Alt text](../../img/cutlass-cute-nccl-cuda/cute/image-swizzle-17.png)
+
+![Alt text](../../img/cutlass-cute-nccl-cuda/cute/image-swizzle-18.png)
+
+同样对于矩阵B，ldmatrix负责读取2个8x8xfp16矩阵，注意B为col-major，这里只需要2个phase完成这一过程，即T0-7为phase 0、T8-15为phase 1，同样，每个phase中的每个线程负责读取列长度为1vec=8xfp16=32bytes=4bank的数据，这4bank数据必须连续，线程间的load地址满足对齐要求，不要求连续
+
+* 只要传给ldmatrix每个线程的地址不合理，就有可能发生bank冲突
+
+![Alt text](../../img/cutlass-cute-nccl-cuda/cute/image-swizzle-19.png)
+
+* 这时候需要引入Swizzle机制了。假设Swizzle<3,3,3>对上述16x16xfp16layout进行重排
+![Alt text](../../img/cutlass-cute-nccl-cuda/cute/image-swizzle-20.png)
+
+![Alt text](../../img/cutlass-cute-nccl-cuda/cute/image-swizzle-21.png)
+
+
+# cutlass swizzle机制解析（二）
+cutlass将GEMM进行了三级tile——thread block tile、warp tile和thread tile（CUDA core/TensorCore），背后的核心思想之一就是数据复用，提高访存效率，解决访存瓶颈。
+
+在GEMM pipeline中，数据搬运流程为：Global memory -> (L2) -> L1/shared memory ->register files -> shared memory -> (L2) -> Global memory，我们往往忽略了一个比较重要的优化点——L2 cache
+
+问题：这个固然有GPU硬件限制（不可编程），另一方面，在PTX/SASS层面进行访存指令调优，使用更宽指令收益显然比调节cache policy/hint等指令缓存行为更有性价比以及可操作性。
+
+* Thread block swizzle机制就是一个从这个层面出发，具体操作是：将CTA索引（blockIdx）与 block tiles进行逻辑重映射，以提高L2 cache命中率，改善局部性。
+
+GPU以一个wave（最大并行运行的CTAs）执行这些blocks的过程中，尽可能提升这些blocks的数据复用，进而一定程度上减少访存开销。
+![Alt text](../../img/cutlass-cute-nccl-cuda/cute/image-swizzle-22.png)
+
+显然，都会认为右边方案更优一些，左边的方案需要访问完整的B，当B非常大时，B更难被L2 cache住，而右边仅需要部分的B，更容易被L2 cache住，而且更符合访存局部性一些。
+
+## 引入swizzle
+
+cutlass在GEMM kernel层面是怎么将各个tile与CTA进行映射的？假设将GEMM将C分成8x8的tile网格（grid），则初始阶段各个tile与CTA之间的索引映射关系如下表所示：
+![Alt text](../../img/cutlass-cute-nccl-cuda/cute/image-swizzle-23.png)
+
+
+
+
+
