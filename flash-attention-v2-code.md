@@ -32,7 +32,7 @@ Block() ->create_block()
 *  用flash_attn_qkvpacked_func函数举例
 FlashAttnKVPackedFunc -> flash_attn_qkvpacked_func
 
-* FlashAttnQKVPackedFunc
+* FlashAttnQKVPackedFunc - forward
 flash_attn_cuda.fwd -> _flash_attn_forward -> forward._wrapped_flash_attn_forward -> FlashAttnQKVPackedFunc
 ```
 if torch.__version__ >= "2.4.0":
@@ -464,3 +464,159 @@ Tensor gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.v_ptr) 
 5. 将结果写回全局内存中。
 
 ![Alt text](./img/attention/flash-attention-v2/image-code-9.png)
+
+
+
+## bwd
+
+* flash_api - bwd - mha_bwd
+dout: 输出梯度，形状为 batch_size x seqlen_q x num_heads x multiple_of(head_size_og, 8)。
+q: 查询张量，形状为 batch_size x seqlen_q x num_heads x head_size。
+k: 键张量，形状为 batch_size x seqlen_k x num_heads_k x head_size。
+v: 值张量，形状为 batch_size x seqlen_k x num_heads_k x head_size。
+out: 输出张量，形状为 batch_size x seqlen_q x num_heads x head_size。
+softmax_lse: softmax的对数和，形状为 batch_size x num_heads x seqlen_q。
+dq_: 查询梯度的可选张量，形状为 batch_size x seqlen_q x num_heads x head_size。
+dk_: 键梯度的可选张量，形状为 batch_size x seqlen_k x num_heads_k x head_size。
+dv_: 值梯度的可选张量，形状为 batch_size x seqlen_k x num_heads_k x head_size。
+alibi_slopes_: ALiBi斜率的可选张量，形状为 num_heads 或 batch_size x num_heads。
+p_dropout: 丢弃概率。
+softmax_scale: softmax的缩放因子。
+is_causal: 是否为因果关系。
+window_size_left: 左窗口大小。
+window_size_right: 右窗口大小。
+softcap: 软上限值。
+deterministic: 是否确定性。
+gen_: 随机数生成器的可选对象。
+rng_state: 随机数状态的可选张量。
+
+
+* dq_、dk_、dv_在反向传播中的作用
+计算输出梯度：从最终输出开始，计算输出梯度 dout。
+计算值的梯度：使用 dout 计算值 V 的梯度 dv_。
+计算键的梯度：使用 dout 和 dv_ 计算键 K 的梯度 dk_。
+计算查询的梯度：使用 dout 和 dk_ 计算查询 Q 的梯度 dq_。
+
+* loop、dq_accum
+loop 变量用于控制是否在计算梯度时使用循环。具体来说，它决定了是否需要将计算任务分成多个小块（blocks）来处理。
+长序列：当序列长度（seqlen_k）大于某个阈值（blocksize_c）时，使用循环可以更高效地处理长序列。
+
+dq: 分块计算：在循环模式下，计算任务会被分成多个小块（blocks），每个小块处理一部分序列。每个小块的梯度会被累积到 dq_accum 中。
+汇总梯度：在所有小块处理完毕后，dq_accum 中累积的梯度会被汇总，得到最终的查询梯度 dq。
+
+* set_params_dgrad
+params: 参数结构体，用于存储所有配置参数。
+batch_size: 批量大小。
+seqlen_q: 查询序列的长度。
+seqlen_k: 键序列的长度。
+seqlen_q_rounded: 查询序列长度四舍五入后的值。
+seqlen_k_rounded: 键序列长度四舍五入后的值。
+num_heads: 注意力头的数量。
+num_heads_k: 键的注意力头数量。
+head_size: 每个注意力头的维度大小。
+head_size_rounded: 每个注意力头维度大小四舍五入后的值。
+q: 查询张量。
+k: 键张量。
+v: 值张量。
+out: 输出张量。
+dout: 输出梯度张量。
+dq: 查询梯度张量。
+dk_expanded: 键梯度扩展张量。
+dv_expanded: 值梯度扩展张量。
+nullptr: 空指针，表示某些参数不需要传递。
+loop ? dq_accum.data_ptr() : nullptr: 如果 loop 为真，传递 dq_accum 的数据指针，否则传递空指针。
+softmax_lse.data_ptr(): softmax 对数求和项的数据指针。
+softmax_d.data_ptr(): softmax 梯度的数据指针。
+p_dropout: dropout 概率。
+softmax_scale: softmax 缩放因子。
+window_size_left: 左窗口大小。
+window_size_right: 右窗口大小。
+softcap: 软上限值。
+deterministic: 是否确定性模式。
+unpadded_lse: 是否使用未填充的对数求和项（此处为 false）。
+
+* launch 发布任务  -> run_mha_bwd -> run_mha_bwd_ 
+run_mha_bwd_ -> 例如：csrc\flash_attn\src\flash_bwd_hdim32_bf16_causal_sm80.cu
+flash_bwd_hdim32_bf16_causal_sm80.cu -> 
+csrc\flash_attn\src\flash_bwd_launch_template.h -> run_flash_bwd
+run_flash_bwd -> run_flash_bwd_seqk_parallel 
+
+1. 计算M和N方向的块数
+2. 调用 flash_bwd_dot_do_o_kernel - compute_dot_do_o 内核函数
+用于计算 dot(do, o) 并将结果（softmax_d）写入全局内存。这个函数主要用于在反向传播过程中并行化处理 seqlen_k 的情况。
+3. flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel - compute_dq_dk_dv_seqk_parallel - compute_dq_dk_dv_1colblock
+
+4. flash_bwd_convert_dq_kernel - convert_dQ<<<>>>
+用于将 dQaccum（以浮点数形式存储）转换为 fp16 或 bf16 格式。这个函数主要用于在反向传播过程中并行化处理 seqlen_k 的情况
+
+
+### compute_dq_dk_dv_1colblock
+csrc\flash_attn\src\flash_bwd_kernel.h - compute_dq_dk_dv_1colblock
+
+* 模板函数
+Kernel_traits: 包含内核特性的类型，如元素类型、累加器类型、索引类型等。
+Is_dropout: 是否启用dropout。
+Is_causal: 是否启用因果掩码（causal masking）。
+Is_local: 是否启用局部注意力（local attention）。
+Has_alibi: 是否启用ALiBi（Attention with Linear Biases）。
+Is_even_MN: 是否M和N是偶数。
+Is_even_K: 是否K是偶数。
+Is_softcap: 是否启用softcap。
+Is_first: 是否是第一个块。
+Is_last: 是否是最后一个块。
+Seq_parallel: 是否启用序列并行。
+Params: 包含参数的类型。
+
+* 入参
+params: 包含所有参数的对象。
+bidb: 块的批处理索引。
+bidh: 块的注意力头索引。
+n_block: 块的数量。
+
+
+* 其他参数
+MMA_N_SdP ：用于计算矩阵乘法累加（MMA）操作中的N维度大小。通过将块的N维度大小除以MMA操作的平铺大小
+AtomLayoutMS ：
+Double_buffer ：
+
+
+* 全局内存张量/共享内存的创建
+* 全局内存平铺复制对象
+* 全局内存/共享内存中的输出梯度矩阵进行分区
+全局内存/共享内存中的键矩阵进行分区
+对共享内存/全局内存中的查询梯度矩阵进行分区
+
+* 使用平铺矩阵乘法累加对象对张量进行分区，确保在CUDA内核中能够高效地进行矩阵乘法操作
+* PREDICATES，根据Is_even_K设置谓词张量
+* 数据复制和同步
+* 根据不同的条件对 scores 张量进行掩码操作，以避免在后续计算中出现数值溢出或不正确的结果
+1. 如果既不是因果关系也不是局部关系，则应用非因果和非局部掩码。
+2. 如果是因果关系，则应用因果掩码。
+3. 如果是局部关系，则应用局部掩码。
+* 计算 scores 张量的指数值，并在必要时应用Dropout操作
+* 将 scores 从 fp32 转换为 fp16/bf16
+
+* 计算注意力分数的梯度， dQK。将矩阵乘法的结果重塑为与 scores 相同的布局，并进行逐点操作
+```
+flash::gemm</*A_in_regs=*/false, /*B_in_regs=*/Kernel_traits::Is_V_in_regs>(
+    acc_dp, tdPrdO, tdPrV, tdPsdO, tdPsV, tiled_mma_sdp,
+    smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV
+);
+```
+* 主要功能是实现Q双缓冲机制，并在必要时更新数据指针和执行数据复制操作
+* 计算 dV 的梯度。具体来说，它执行的是 P 的转置和 dO 的转置的矩阵乘法，结果存储在 acc_dv 中
+```
+flash::gemm(acc_dv, tdVrPt, tdVrdO, tdVsPt, tdVsdOt, tiled_mma_dkv,
+                    smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt);
+```
+* 计算 dQ 的梯度。具体来说，它执行的是 dS 和 K 的转置的矩阵乘法，结果存储在 acc_dq 中。
+```
+flash::gemm(acc_dq, tdQrdS, tdQrKt, tdQsdS, tdQsKt, tiled_mma_dq,
+            smem_tiled_copy_dS, smem_tiled_copy_Kt, smem_thr_copy_dS, smem_thr_copy_Kt);
+```
+* 计算 dK 的梯度。具体来说，它执行的是 dS 的转置和 Q 的转置的矩阵乘法，结果存储在 acc_dk 中
+```
+flash::gemm(acc_dk, tdKrdSt, tdKrQt, tdKsdSt, tdKsQt, tiled_mma_dkv,
+                    smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt);
+```
+
