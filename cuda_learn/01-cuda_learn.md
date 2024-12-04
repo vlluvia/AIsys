@@ -55,6 +55,7 @@ atomicXor(&g_odata[10], tid);
 ```
 
 * L2的访问策略窗口
+Samples\0_Introduction\simpleAttributes\simpleAttributes.cu
 允许开发者显式地控制哪些内存区域应该被持久化到L2缓存中，从而优化内存访问性能。
 ```
 cudaAccessPolicyWindow initAccessPolicyWindow(void) {
@@ -72,6 +73,13 @@ cudaStreamAttrValue streamAttrValue;
 streamAttrValue.accessPolicyWindow = initAccessPolicyWindow();
 accessPolicyWindow = initAccessPolicyWindow();
 ```
+
+* 协作组和屏障
+Samples\0_Introduction\simpleAWBarrier.cu
+使用CUDA的协作组和屏障来实现高效的向量归一化。通过使用协作组和屏障，代码能够在块内和块间同步线程，从而实现高效的并行计算
+
+
+* 流和回调
 
 
 
