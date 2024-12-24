@@ -179,6 +179,120 @@ nvprof ./reduce
 
 ### 使用线程束函数与协作组
 
+如果在条件语句中，同一线程束中的线程执行不同的指令，就会发生线程束分化(warp divergence) ，导致性能出现明显下降
 
+![Alt text](../../img/cutlass-cute-nccl-cuda/cuda/image-cuda-02-8.png)
+
+* \_\_syncwarp
+  
+在归约问题中，当所涉及的线程都在一个线程束内时，可以将线程块同步函 数 __syncthreads 换成一个更加廉价的线程束同步函数 __syncwarp。
+
+```
+    for (int offset = blockDim.x >> 1; offset >= 32; offset >>= 1)
+    {
+        if (tid < offset)
+        {
+            s_y[tid] += s_y[tid + offset];
+        }
+        __syncthreads();
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        if (tid < offset)
+        {
+            s_y[tid] += s_y[tid + offset];
+        }
+        __syncwarp();
+    }
+```
+当 offset >= 32 时，我们在每一次折半求和后使用线程块同步函 数 __syncthreads; 当 offset <= 16 时，我们在每一次折半求和后使用束内同步函数 __syncwarp。
+
+* \_\_shfl_down_sync
+
+函数 \_\_shfl_down_sync 的作用是将高线程号的数据平移到低线程号中去，这正是归约问题中需要的操作
+
+```
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        y += __shfl_down_sync(FULL_MASK, y, offset);
+    }
+```
+
+
+* 协作组(cooperative groups)
+
+```
+#include <cooperative_groups.h>
+using namespace cooperative_groups;
+```
+
+可以用函数 tiled_partition 将一个线程块划分为若干片(tile)，每一片构成一个 新的线程组。目前仅仅可以将片的大小设置为 2 的正整数次方且不大于 32，也就是 2、 4、8、16 和 32 。例如，如下语句通过函 数 tiled_partition 将一个线程块分割为我们熟知的线程束:
+```
+ thread_group g32 = tiled_partition(this_thread_block(), 32); 
+```
+同时线程块片类型中也有洗牌函数，可以利用线程块片来进行数组归约的计算。
+```
+    real y = s_y[tid];
+
+    thread_block_tile<32> g = tiled_partition<32>(this_thread_block());
+    for (int i = g.size() >> 1; i > 0; i >>= 1)
+    {
+        y += g.shfl_down(y, i);
+    }
+```
+
+* 进一步分析和优化
+用一个寄存器变量 y，用来在循环 体中对读取的全局内存数据进行累加， 在规约之前，必须将寄存器中的数据复制到共享内存
+```
+    real y = 0.0;
+    const int stride = blockDim.x * gridDim.x;
+    for (int n = bid * blockDim.x + tid; n < N; n += stride)
+    {
+        y += d_x[n];
+    }
+    s_y[tid] = y;
+    __syncthreads();
+```
+
+```
+real reduce(const real *d_x)
+{
+    const int ymem = sizeof(real) * GRID_SIZE;
+    const int smem = sizeof(real) * BLOCK_SIZE;
+
+    real h_y[1] = {0};
+    real *d_y;
+    CHECK(cudaMalloc(&d_y, ymem));
+
+    reduce_cp<<<GRID_SIZE, BLOCK_SIZE, smem>>>(d_x, d_y, N);
+    reduce_cp<<<1, 1024, sizeof(real) * 1024>>>(d_y, d_y, GRID_SIZE);
+
+    CHECK(cudaMemcpy(h_y, d_y, sizeof(real), cudaMemcpyDeviceToHost));
+    CHECK(cudaFree(d_y));
+
+    return h_y[0];
+}
+```
+```
+__device__ real static_y[GRID_SIZE];
+
+real reduce(const real *d_x)
+{
+    real *d_y;
+    CHECK(cudaGetSymbolAddress((void**)&d_y, static_y));
+
+    const int smem = sizeof(real) * BLOCK_SIZE;
+
+    reduce_cp<<<GRID_SIZE, BLOCK_SIZE, smem>>>(d_x, d_y, N);
+    reduce_cp<<<1, 1024, sizeof(real) * 1024>>>(d_y, d_y, GRID_SIZE);
+
+    real h_y[1] = {0};
+    CHECK(cudaMemcpy(h_y, d_y, sizeof(real), cudaMemcpyDeviceToHost));
+    // CHECK(cudaMemcpyFromSymbol(h_y, static_y, sizeof(real)); // also ok
+
+    return h_y[0];
+}
+```
 
 
