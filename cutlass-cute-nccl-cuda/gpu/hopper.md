@@ -32,5 +32,5 @@ H800为例，其Global Memory 大小为 80GB，而每个 Thread Block 最大可�
 
 为了解决 Thread Block 粒度过小导致的 Kernel 运行效率不足的问题，Hooper 在 Thread Block 之上再引入一层结构——Thread Block Clusters。
 
-![Alt text](image-hopper-1.png)
+![Alt text](../../img/hopper/image-hopper-1.png)
 
