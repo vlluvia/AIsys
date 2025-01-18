@@ -95,9 +95,11 @@ wgmma.fence.sync.aligned ： 用于确保在执行 WGMMA 操作之前，所有�
 memory：确保内存的一致性
 
 * asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+
 wgmma.commit_group.sync.aligned： 提交一组 WGMMA 操作，并等待这些操作完成
 
 * asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
+
 wgmma.wait_group.sync.aligned：等待特定 WGMMA 操作组完成时调用
 
 
@@ -122,27 +124,41 @@ warpgroup_wait<N>();
 
 #### wgmma64
 1. 参数
+
 ScaleD, ScaleA, ScaleB： 缩放因子
+
 TransA, TransB： 0 表示不转置，1 表示转置
 
 
 2. 生成共享内存描述符
+
 告诉 WGMMA 指令如何访问共享内存中的数据
+
 uint64_t desc_a = make_smem_desc(&sA[0]);
+
 uint64_t desc_b = make_smem_desc(&sB[0]);
 
 3. 内联汇编调用 WGMMA 指令
+
 * 执行异步的矩阵乘加操作：
-m64n64k16：表示矩阵乘法的维度（64x64x16）
+
+m64n64k16：表示矩阵乘法的维度（64x64x16
+）
+
 f32.bf16.bf16： 输入矩阵 A 和 B 的数据类型是 bf16，输出矩阵 d 的数据类型是 f32。
+
 wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16
 
 * 输出操作数
+
 d 的 32 个元素
 
 * 输入操作数
+
 共享内存描述符 desc_a/desc_b
+
 模板参数 ScaleD, ScaleA, ScaleB, TransA, TransB
+
 ```
 asm volatile(
     "{\n"
@@ -172,24 +188,39 @@ asm volatile(
 ### TMA
 
 * 全局/共享内存形状（shape）：{水平方向大小，垂直方向大小，其余维度为1 表示这是一个 2D 张量}
+
 gmem_prob_shape[5] = {(uint64_t)BlockMinorSize*blocks_width, (uint64_t)BlockMajorSize*blocks_height, 1, 1, 1};
 
 * 全局/共享内存步幅（stride）Swizzle：{水平方向的步幅，垂直方向的步幅，其余步幅为0表示这是一个连续的内存布局}
+
 相邻元素之间的字节数
+
 uint64_t gmem_prob_stride[5] = {sizeof(bf16), sizeof(bf16) * BlockMinorSize*blocks_width, 0, 0, 0};
 
 * cuTensorMapEncodeTiled
+
 tma_map: 输出的张量映射。
+
 CU_TENSOR_MAP_DATA_TYPE_BFLOAT16: 数据类型为 bfloat16。
+
 2: 张量的维度（2D）。
+
 gmem_address: 全局内存地址。
+
 gmem_prob_shape: 全局内存形状。
+
 gmem_prob_stride + 1: 全局内存步幅（跳过第一个步幅）。
+
 smem_box_shape: 共享内存形状。
+
 smem_box_stride: 共享内存步幅。
+
 CU_TENSOR_MAP_INTERLEAVE_NONE: 不使用交错存储。
+
 CU_TENSOR_MAP_SWIZZLE_128B: 使用 128B swizzle 内存布局。
+
 CU_TENSOR_MAP_L2_PROMOTION_NONE: 不使用 L2 缓存提升。
+
 CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE: 不填充越界数据。
 
 ```
@@ -224,16 +255,22 @@ cudaMemcpy(tma_map_d, &tma_map_host, sizeof(CUtensorMap), cudaMemcpyHostToDevice
 
 
 * 定义
+
 using barrier = cuda::barrier<cuda::thread_scope_block>;
+
 namespace cde = cuda::device::experimental;
 
 
 alignas(128)：确保 sA 和 sB 的起始地址是 128 的倍数
+
 d[WGMMA_N/16][8]：存储 wgmma 操作的结果， WGMMA_N为64
 \_\_shared__ barrier barA/barB;
 
+
 cde::fence_proxy_async_shared_cta(): 内存屏障, 确保在调用该函数之前的所有内存操作（如共享内存的初始化）在后续操作之前完成。
+
 barrier: 通常用于管理异步操作（如 cp_async）的同步，而不涉及线程块内的其他操作
+
 \_\_syncthreads(): 线程同步, 确保线程块中的所有线程在执行到该点时都达到同步状态(bar 初始化完成)，所有操作，包括共享内存的读写、寄存器操作等
 
 ```
@@ -266,13 +303,21 @@ for (xxxx) {
 
 * load data A/B
 cde::cp_async_bulk_tensor_2d_global_to_shared：
+
 用于将全局内存中的数据异步拷贝到共享内存中。
+
 意味着拷贝操作会在后台执行，而线程可以继续执行其他任务，直到需要同步时再等待拷贝完成。
+
 &sA[0]：共享内存的目标地址。
+
 tensorMapA：全局内存的 Tensor Map，描述了全局内存的布局和访问模式。
+
 block_k_iter * BK：全局内存中的行偏移量。
+
 num_block_m * BM：全局内存中的列偏移量。
+
 barA：barrier 对象，用于管理异步拷贝操作的同步。
+
 
 ```
 tokenA = cuda::device::barrier_arrive_tx(barA, 1, sizeof(sA))
@@ -294,13 +339,16 @@ warpgroup_commit_batch();  // 提交 WGMMA 操作
 warpgroup_wait<0>();  // 等待 WGMMA 操作完成
 ```
 WGMMA_K: 16
+
 BK: 64
 
 
 
 * 存储数据
 BM 64
+
 BN 64
+
 BK 64
 
 ```
@@ -333,6 +381,5 @@ BK 64
         }
     }
 ```
-
 
 
