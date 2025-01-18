@@ -5,48 +5,56 @@
 * blockid, block y/x
 
 * warpid，warp y/x
-threadIdx.x / 32
-warpIdx % (BN / WN)
-warpIdx / (BN / WN)
+
+threadIdx.x / 32  
+warpIdx % (BN / WN)  
+warpIdx / (BN / WN)  
 
 * Warp ITER(y, x), WSUBM, WSUBN
-WNITER
-WMITER = (WM * WN) / (32 * TM * TN * WNITER)
-WSUBM = WM / WMITER
-WSUBN = WN / WNITER
+
+WNITER  
+WMITER = (WM * WN) / (32 * TM * TN * WNITER)  
+WSUBM = WM / WMITER  
+WSUBN = WN / WNITER  
 
 * thread in warp: id, y/x
-threadIdx.x % 32
-threadIdxInWarp % (WSUBN / TN)
-threadIdxInWarp / (WSUBN / TN)
+
+threadIdx.x % 32  
+threadIdxInWarp % (WSUBN / TN)  
+threadIdxInWarp / (WSUBN / TN)  
 
 * smem, reg
-As[BM * BK], Bs[BK * BN]
-regM[WMITER * TM], regN[WNITER * TN]
+
+As[BM * BK], Bs[BK * BN]  
+regM[WMITER * TM], regN[WNITER * TN]  
 
 * A行起始位置，B列起始位置
 
 
 
 * 数据加载到共享存储的索引
-innerRowA/B = threadIdx.x / (BK/N / 4)
-innerColA/B = threadIdx.x % (BK/N / 4)
-rowStrideA/B = NUM_THREADS / (BK/N / 4)
+
+innerRowA/B = threadIdx.x / (BK/N / 4)  
+innerColA/B = threadIdx.x % (BK/N / 4)  
+rowStrideA/B = NUM_THREADS / (BK/N / 4)  
 
 
 * bkidx , 0 -> K , +BK
-1. load A - > Asmem
-2. load B - > Bsmem
+
+1. load A - > Asmem  
+2. load B - > Bsmem  
    
 * dotidx, 0 -> BKm, +1
-3. load Asmem -> Areg
-4. load Bsmem -> Breg
+
+1. load Asmem -> Areg  
+2. load Bsmem -> Breg
 
 * matmul
-wSubRowIdx, 0 - > WMITER, + 1
-wSubColIdx, 0 - > WNITER, + 1
 
-计算TM/TN中每个线程的结果
+wSubRowIdx, 0 - > WMITER, + 1  
+wSubColIdx, 0 - > WNITER, + 1  
+
+计算TM/TN中每个线程的结果  
 
 threadResults[(wSubRowIdx * TM + resIdxM) * (WNITER * TN) +
                             (wSubColIdx * TN) + resIdxN] +=
@@ -62,19 +70,28 @@ threadResults[(wSubRowIdx * TM + resIdxM) * (WNITER * TN) +
 ### 生成共享内存描述符
 
 1. 编码共享内存地址到描述符的低 16 位
+
 desc |= matrix_descriptor_encode(addr);
+
 2. 编码矩阵的行数（16）到描述符的 16-31 位
+
 desc |= matrix_descriptor_encode((uint64_t)16) << 16;
+
 3. 编码矩阵的列数（1024）到描述符的 32-47 位
+
 desc |= matrix_descriptor_encode((uint64_t)1024) << 32;
+
 4. 设置 128B swizzle 标志位（第 62 位）
+
 desc |= 1llu << 62; // 128B swizzle
 
 ### wgmma 
 
 #### wgmma 大局
 * asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-wgmma.fence.sync.aligned ： 用于确保在执行 WGMMA 操作之前，所有先前的内存操作（如加载数据到共享内存）已经完成
+
+wgmma.fence.sync.aligned ： 用于确保在执行 WGMMA 操作之前，所有先前的内存操作（如加载数据到共享内存）已经完成  
+
 memory：确保内存的一致性
 
 * asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
