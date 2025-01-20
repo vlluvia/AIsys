@@ -1147,8 +1147,282 @@ __device__ void arrive_cluster(uint64_t* bar, uint32_t cta_id, uint32_t count=1)
 
 constexpr int CLUSTERS = CLUSTER_M * CLUSTER_N;
 
+* 获取 Cluster ID
+uint32_t rank;
 
-* 使用
+asm volatile("mov.u32 %0, %clusterid.x;\n" : "=r"(rank) :);
 
 
+*  Cluster 级别实现线程块的同步
+init_barrier(&full[i], 0, 1);
+
+init_barrier(&empty[i], 0, num_consumers*CLUSTERS);
+
+* Schedule
+Schedule<1, NUM_SM/CLUSTERS, BM*CLUSTER_M, BN*CLUSTER_N, 16/CLUSTER_M, 8/CLUSTER_N> schedule(M, N, rank);
+
+* 获取当前线程块在 Cluster 中的逻辑坐标（rank_m 和 rank_n），并将其分解为二维坐标（行和列）
+
+asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(rank) :);
+
+uint32_t rank_m = rank / CLUSTER_N;
+
+uint32_t rank_n = rank % CLUSTER_N;
+
+
+* 
+```
+// Producer
+if (wg_idx == 0){
+    xxx
+    if(tid == 0){
+        xxx
+        uint32_t col_mask = 0;               // 在多 Cluster 环境中标识特定列的所有线程块
+        for (int i = 0; i < CLUSTER_M; ++i) {
+            col_mask |= (1 << (i * CLUSTER_N));
+        }
+        xxx
+        while (schedule.next(num_block_m, num_block_n)) {
+            num_block_n = num_block_n * CLUSTER_N + rank_n;
+            num_block_m = num_block_m * CLUSTER_M + rank_m;
+
+            for (int block_k_iter = 0; block_k_iter < num_blocks_k; ++block_k_iter, ++qidx) {
+                xxx
+
+                if constexpr (CLUSTER_N > 1) {
+                    uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
+                    if (rank_n == 0) {
+                        load_async_multicast(&sA[qidx*BK*BM], &tensorMapA, &full[qidx], block_k_iter*BK, num_block_m*BM, mask);         异步多播加载函数
+                    }
+                } else {
+                    load_async(&sA[qidx*BK*BM], &tensorMapA, &full[qidx], block_k_iter*BK, num_block_m*BM);
+                }
+
+                xxx
+            }
+        }
+    }
+} else {
+    for (int qidx = 0; qidx < QSIZE; ++qidx) {
+        if (tid < CLUSTERS) arrive_cluster(&empty[qidx], tid);
+    }
+
+    xxx
+
+    while (schedule.next(num_block_m, num_block_n)) {
+        num_block_n = num_block_n * CLUSTER_N + rank_n;
+        num_block_m = num_block_m * CLUSTER_M + rank_m;
+
+        xxx
+        for (xxx) {
+            if (tid < CLUSTERS) arrive_cluster(&empty[qidx], tid);
+        }
+    }
+}
+
+```
+
+
+
+
+## Version 9 - __stwt
+
+```
+// int col = 8*w + (tid % 4);
+// #define IDX(i, j) ((((i) + yo)*N/2 + (j)))
+// block_C[IDX(row, col)] = __halves2bfloat162(d[m_it][w][0], d[m_it][w][1]);
+// block_C[IDX(row + 8, col)] = __halves2bfloat162(d[m_it][w][2], d[m_it][w][3]);
+// block_C[IDX(row, col + 4)] = __halves2bfloat162(d[m_it][w][4], d[m_it][w][5]);
+// block_C[IDX(row + 8, col + 4)] = __halves2bfloat162(d[m_it][w][6], d[m_it][w][7]);
+// #undef IDX
+int col = w + 2*(tid % 4);
+#define IDX(i, j) ((j)*M + ((i) + yo))
+#define ST(i, j, v) __stwt(&block_C[IDX(i, j)], v);
+
+ST(row+8, col, d[m_it][w/16][2]);
+ST(row, col, d[m_it][w/16][0]);
+
+ST(row+8, col+1, d[m_it][w/16][3]);
+ST(row, col+1, d[m_it][w/16][1]);
+
+ST(row+8, col+8, d[m_it][w/16][6]);
+ST(row, col+8, d[m_it][w/16][4]);
+
+ST(row+8, col+9, d[m_it][w/16][7]);
+ST(row, col+9, d[m_it][w/16][5]);
+
+#undef IDX
+#undef ST
+```
+
+
+
+
+## Version 10 - 异步写入全局内存
+
+
+* 定义
+CUtensorMap d_tma_map_A;
+
+CUtensorMap d_tma_map_B;
+
+CUtensorMap d_tma_map_C;
+
+```
+template <int BM, int BN, int BK, int QSIZE>
+struct SMem {
+    alignas(128) bf16 A[BM*BK*QSIZE];
+    alignas(128) bf16 B[BK*BN*QSIZE];
+    alignas(128) bf16 C[BN*BM];
+    alignas(8) uint64_t full[QSIZE], empty[QSIZE];
+};
+```
+
+* cp.async.bulk.tensor
+
+```
+__device__ static inline void store_async(void const* dst_tma_map, bf16 *src, int global_col_idx, int global_row_idx) {
+    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(dst_tma_map);
+    uint32_t src_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+
+    asm volatile (
+        "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
+        " [%0, {%2, %3, %4}], [%1];"
+        :
+        : "l"(tma_ptr), "r"(src_ptr),
+        "n"(0), "r"(global_row_idx), "r"(global_col_idx / 64)
+        : "memory"
+    );
+}
+```
+
+
+* 加载到全局内存
+```
+asm volatile("cp.async.bulk.wait_group 0;");  // 等待异步操作完成
+
+int lane = tid % 32, warp = tid / 32;
+int row = warp*16 + lane / 4;
+bf16* block_sC = sC + wg_idx*B_WG_M*BN;
+
+#pragma unroll
+for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
+
+
+}
+// 用于同步线程块中的线程，并异步地将共享内存中的数据写入全局内存
+asm volatile("bar.sync 10, 256;\n");
+if (threadIdx.x == 128) {
+    store_async(&tensorMapC, (bf16*)&sC[0], num_block_m*BM, num_block_n*BN);
+    // 提交异步操作组
+    asm volatile("cp.async.bulk.commit_group;"); 
+}
+
+```
+
+
+## Version 10 -  Hilbert调度
+
+```
+
+// Rotate/flip quadrant appropriately
+void rot(int n, int& x, int& y, int rx, int ry) {
+    if (ry == 0) {
+        if (rx == 1) {
+            x = n-1 - x;
+            y = n-1 - y;
+        }
+        // Swap x and y
+        int t = x;
+        x = y;
+        y = t;
+    }
+}
+
+// Convert distance along curve to (x,y) point
+void d2xy(int n, int d, int& x, int& y) {
+    int rx, ry, s, t = d;
+    x = y = 0;
+    for (s = 1; s < n; s *= 2) {
+        rx = 1 & (t/2);
+        ry = 1 & (t ^ rx);
+        rot(s, x, y, rx, ry);
+        x += s * rx;
+        y += s * ry;
+        t /= 4;
+    }
+}
+
+void createHilbert(int M, int N, int CORES, int *space) {
+    int dim = (1 << (32 - __builtin_clz(max(M, N) - 1)));
+    int core = 0;
+    std::vector<std::string> v(dim, std::string(dim, '.'));
+    memset(space, -1, sizeof(int)*CORES*SPACE_LEN);
+    int FCORES = 64;
+    int total = 0;
+    std::vector<std::vector<int>> pos(CORES, std::vector<int>());
+    for (int i = 0; i < dim*dim; ++i) {
+        int x, y;
+        d2xy(dim, i, x, y);
+        if (x < M && y < N) {
+            assert(loc < SPACE_LEN);
+            assert(v[x][y] == '.');
+            v[x][y] = '*';
+            ++total;
+            pos[core].push_back((x << 16) | y);
+            ++core;
+            if (core == FCORES) {core = 0;}
+        }
+    }
+    core = FCORES;
+    for (int i = 0; i < FCORES; ++i) {
+        if (pos.back().size() >= pos[0].size()-1) break;
+        pos[core].push_back(pos[i].back());
+        pos[i].pop_back();
+        ++core;
+        if (core == CORES) {core = FCORES;}
+    }
+    for (int i = 0; i < CORES; ++i) {
+        for (int j = 0; j < pos[i].size(); ++j) {
+            space[i*SPACE_LEN + j] = pos[i][j];
+        }
+    }
+    assert(total == M*N);
+}
+```
+
+```
+template<int NUM_SM, int BM, int BN, int TM, int TN>
+struct Schedule<2, NUM_SM, BM, BN, TM, TN> {
+    int it;
+    int *space;
+
+    __device__ __forceinline__ Schedule(int M, int N, int block, int *_space) {
+        it = 0;
+        space = _space;
+    }
+
+    __device__ __forceinline__ bool next(int &block_m, int& block_n) {
+        if (it >= SPACE_LEN) {
+            return false;
+        }
+        int now = space[it];
+        if (now == -1) {
+            return false;
+        }
+        block_m = now >> 16;
+        block_n = (now & ((1<<16)-1));
+        ++it;
+        return true;
+    }
+};
+```
+
+```
+int *space;
+space = (int*)malloc(sizeof(int)*NUM_SM*SPACE_LEN);
+createHilbert(CEIL_DIV(M, BM*CLUSTER_M), CEIL_DIV(N, BN*CLUSTER_N), NUM_SM/CLUSTER_M/CLUSTER_N, space);
+cudaCheck(cudaMalloc((void **)&_dspace, sizeof(int)*NUM_SM*SPACE_LEN));
+cudaCheck(cudaMemcpy(_dspace, space, sizeof(int)*NUM_SM*SPACE_LEN, cudaMemcpyHostToDevice));
+```
 
